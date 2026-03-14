@@ -1,31 +1,17 @@
-package agentsession
+package session
 
 import (
 	"context"
-	"regexp"
-	"slack-agent/internal/sessionlog"
 	"sync"
 
 	agent "github.com/rahulSailesh-shah/go-pi-agent"
 )
 
-type Compactor interface {
-	PrepareCompaction(pathEntries []sessionlog.Entry) *CompactionPreparation
-	Compact(ctx context.Context, preparation *CompactionPreparation) (*sessionlog.CompactionEntry, error)
-}
-
-type CompactionPreparation struct {
-	EntriesToSummarize []sessionlog.Entry
-	EntriesToKeep      []sessionlog.Entry
-	FirstKeptEntryID   string
-	TokensBefore       int
-}
-
 type EventListener func(event agent.AgentEvent)
 
 type AgentSession struct {
 	agent          *agent.Agent
-	sessionManager sessionlog.Manager
+	sessionManager Manager
 	compactor      Compactor
 
 	mu             sync.Mutex
@@ -46,7 +32,7 @@ type AgentSession struct {
 
 type Config struct {
 	Agent          *agent.Agent
-	SessionManager sessionlog.Manager
+	SessionManager Manager
 	Compactor      Compactor
 }
 
@@ -120,14 +106,12 @@ func (s *AgentSession) handleAgentEvent(event agent.AgentEvent) {
 func (s *AgentSession) Prompt(ctx context.Context, text string, images ...agent.ImageContent) error {
 	lastAssistant := s.findLastAssistantMessage()
 	if lastAssistant != nil {
-		// s.checkCompaction(lastAssistant, false)
+		s.checkCompaction(ctx, lastAssistant)
 	}
 
 	if err := s.agent.Prompt(ctx, text, images...); err != nil {
 		return err
 	}
-
-	s.waitForRetry()
 
 	return nil
 }
@@ -144,75 +128,90 @@ func (s *AgentSession) SetSystemPrompt(prompt string) {
 	s.agent.SetSystemPrompt(prompt)
 }
 
-// Abort cancels any in-progress operation (stream, retry, compaction).
+// checks if compaction is needed based on the last assistant message, generates a summary and appends it to the session
+func (s *AgentSession) checkCompaction(ctx context.Context, lastAssistant *agent.AssistantMessage) {
+	if lastAssistant == nil || lastAssistant.StopReason == agent.StopReasonAborted {
+		return
+	}
+
+	contextWindow := 200000
+
+	latestCompaction := s.sessionManager.GetLatestCompaction()
+	if latestCompaction != nil && lastAssistant.Timestamp.Before(latestCompaction.Timestamp) {
+		return
+	}
+
+	// Case 1: Overflow - LLM returned context overflow error
+	if IsContextOverflow(lastAssistant, contextWindow) {
+		s.runCompaction(ctx)
+		return
+	}
+
+	// Case 2: Threshold - context is getting large.
+	// For error messages (no usage data), estimate from last successful response.
+	// This ensures sessions that hit persistent API errors can still compact.
+	var contextTokens int
+	if lastAssistant.StopReason == agent.StopReasonError {
+		messages := s.agent.State().Messages
+		lastUsage := findLastUsage(messages)
+		if lastUsage == nil {
+			return
+		}
+		if latestCompaction != nil && !lastUsage.Timestamp.After(latestCompaction.Timestamp) {
+			return
+		}
+		contextTokens = estimateContextTokens(messages)
+	} else {
+		contextTokens = lastAssistant.Usage.TotalTokens
+	}
+
+	compactionThreshold := int(float64(contextWindow) * 0.80)
+	if contextTokens >= compactionThreshold {
+		s.runCompaction(ctx)
+	}
+}
+
+func (s *AgentSession) runCompaction(ctx context.Context) {
+	branch := s.sessionManager.GetBranch(nil)
+	if len(branch) == 0 {
+		return
+	}
+
+	prep := s.compactor.PrepareCompaction(branch)
+	if prep == nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	s.compactionCancel = cancel
+	defer cancel()
+
+	entry, err := s.compactor.Compact(ctx, prep)
+	if err != nil {
+		_ = err // TODO: logging
+		return
+	}
+
+	if _, err := s.sessionManager.AppendCompaction(
+		entry.Summary,
+		entry.FirstKeptEntryID,
+		entry.TokensBefore,
+		entry.Details,
+	); err != nil {
+		_ = err // TODO: logging
+		return
+	}
+
+	sessionContext := s.sessionManager.BuildSessionContext()
+	s.agent.ReplaceMessages(sessionContext.Messages)
+}
+
 func (s *AgentSession) Abort() {
-	s.abortRetry()
-	// s.abortCompaction()
+	// s.abortRetry()
+	if s.compactionCancel != nil {
+		s.compactionCancel()
+	}
 	s.agent.Abort()
-}
-
-// retryablePattern matches error messages that should be retried.
-var retryablePattern = regexp.MustCompile(
-	`(?i)overloaded|rate.?limit|too many requests|429|500|502|503|504|` +
-		`service.?unavailable|server error|internal error|connection.?error|` +
-		`connection.?refused|other side closed|fetch failed|upstream.?connect|` +
-		`reset before headers|terminated|retry delay`,
-)
-
-func (s *AgentSession) isRetryableError(msg *agent.Message) bool {
-	// TODO: Check for stop reason and determine if it is retryable
-	return true
-}
-
-func (s *AgentSession) handleRetryableError(msg *agent.Message) bool {
-	// TODO: implements exponential backoff retry.
-	//  Returns true if a retry was initiated, false if disabled or max exceeded.
-
-	return true
-}
-
-func (s *AgentSession) abortRetry() {
-	s.retryMu.Lock()
-	if s.retryCancel != nil {
-		s.retryCancel()
-		s.retryCancel = nil
-	}
-	s.retryMu.Unlock()
-	s.resolveRetry()
-}
-
-func (s *AgentSession) waitForRetry() {
-	s.retryMu.Lock()
-	done := s.retryDone
-	s.retryMu.Unlock()
-
-	if done != nil {
-		<-done
-	}
-}
-
-func (s *AgentSession) resolveRetry() {
-	s.retryMu.Lock()
-	defer s.retryMu.Unlock()
-	if s.retryDone != nil {
-		select {
-		case <-s.retryDone:
-			// already closed
-		default:
-			close(s.retryDone)
-		}
-		s.retryDone = nil
-	}
-}
-
-func (s *AgentSession) findLastAssistantMessage() *agent.Message {
-	messages := s.agent.State().Messages
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role() == "assistant" {
-			return &messages[i]
-		}
-	}
-	return nil
 }
 
 func (s *AgentSession) Dispose() {
@@ -223,4 +222,14 @@ func (s *AgentSession) Dispose() {
 	s.mu.Lock()
 	s.listeners = nil
 	s.mu.Unlock()
+}
+
+func (s *AgentSession) findLastAssistantMessage() *agent.AssistantMessage {
+	messages := s.agent.State().Messages
+	for i := len(messages) - 1; i >= 0; i-- {
+		if am, ok := messages[i].(agent.AssistantMessage); ok {
+			return &am
+		}
+	}
+	return nil
 }

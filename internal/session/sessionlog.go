@@ -1,4 +1,4 @@
-package sessionlog
+package session
 
 import (
 	"bufio"
@@ -62,6 +62,7 @@ type Manager interface {
 	GetBranch(fromID *string) []Entry
 	GetEntries() []Entry
 	BuildSessionContext() Context
+	GetLatestCompaction() *CompactionEntry
 }
 
 type DefaultManager struct {
@@ -114,54 +115,48 @@ func (sm *DefaultManager) BuildSessionContext() Context {
 		return Context{}
 	}
 
-	path := sm.getBranchLocked(sm.leafID)
-	if len(path) == 0 {
-		return Context{}
-	}
-
-	// Find the last compaction entry on the path
+	var afterCompaction []agent.Message
+	var keptMessages []agent.Message
 	var compaction *CompactionEntry
-	compactionIdx := -1
-	for i, entry := range path {
-		if ce, ok := entry.(*CompactionEntry); ok {
-			compaction = ce
-			compactionIdx = i
+
+	current := sm.byID[*sm.leafID]
+	done := false
+
+	for current != nil && !done {
+		if compaction == nil {
+			if ce, ok := current.(*CompactionEntry); ok {
+				compaction = ce
+			} else if msg := extractMessage(current); msg != nil {
+				afterCompaction = append(afterCompaction, *msg)
+			}
+		} else {
+			if msg := extractMessage(current); msg != nil {
+				keptMessages = append(keptMessages, *msg)
+			}
+			if current.EntryID() == compaction.FirstKeptEntryID {
+				done = true
+			}
 		}
+
+		pid := current.EntryParentID()
+		if pid == nil {
+			break
+		}
+		current = sm.byID[*pid]
 	}
 
-	var messages []agent.Message
-
-	if compaction != nil {
-		// 1. Emit compaction summary as a synthetic user message
-		summaryMsg := compactionToUserMessage(*compaction)
-		messages = append(messages, summaryMsg)
-
-		// 2. Emit kept messages (before compaction, from FirstKeptEntryID onward)
-		foundFirstKept := false
-		for i := 0; i < compactionIdx; i++ {
-			if path[i].EntryID() == compaction.FirstKeptEntryID {
-				foundFirstKept = true
-			}
-			if foundFirstKept {
-				if msg := extractMessage(path[i]); msg != nil {
-					messages = append(messages, *msg)
-				}
-			}
-		}
-
-		// 3. Emit messages after compaction
-		for i := compactionIdx + 1; i < len(path); i++ {
-			if msg := extractMessage(path[i]); msg != nil {
-				messages = append(messages, *msg)
-			}
-		}
-	} else {
-		for _, entry := range path {
-			if msg := extractMessage(entry); msg != nil {
-				messages = append(messages, *msg)
-			}
-		}
+	if compaction == nil {
+		reverseMessages(afterCompaction)
+		return Context{Messages: afterCompaction}
 	}
+
+	reverseMessages(keptMessages)
+	reverseMessages(afterCompaction)
+
+	messages := make([]agent.Message, 0, 1+len(keptMessages)+len(afterCompaction))
+	messages = append(messages, compactionToUserMessage(*compaction))
+	messages = append(messages, keptMessages...)
+	messages = append(messages, afterCompaction...)
 
 	return Context{Messages: messages}
 }
@@ -338,6 +333,17 @@ func (sm *DefaultManager) GetEntries() []Entry {
 	return out
 }
 
+func (sm *DefaultManager) GetLatestCompaction() *CompactionEntry {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for i := len(sm.entries) - 1; i >= 0; i-- {
+		if ce, ok := sm.entries[i].(*CompactionEntry); ok {
+			return ce
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Write operations (append-only)
 // ---------------------------------------------------------------------------
@@ -435,4 +441,10 @@ func extractMessage(entry Entry) *agent.Message {
 		return &me.Message
 	}
 	return nil
+}
+
+func reverseMessages(messages []agent.Message) {
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
 }
