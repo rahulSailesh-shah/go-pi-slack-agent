@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"os"
 	"strings"
@@ -34,21 +33,21 @@ type CompactorConfig struct {
 	MaxSummaryTokens int
 }
 
-type DefaultCompactor struct {
+type LLMCompactor struct {
 	complete         func(ctx context.Context, req gopiai.Request) (gopiai.AssistantMessage, error)
 	model            string
 	keepRecentTokens int
 	maxSummaryTokens int
 }
 
-func NewCompactor(config *CompactorConfig) *DefaultCompactor {
+func NewCompactor(config *CompactorConfig) (*LLMCompactor, error) {
 	if config == nil {
 		provider, err := openai.NewProvider(openai.Config{
 			APIKey:  os.Getenv("CEREBRAS_API_KEY"),
 			BaseURL: os.Getenv("CEREBRAS_BASE_URL"),
 		})
 		if err != nil {
-			log.Fatalf("Failed to create provider: %v", err)
+			return nil, fmt.Errorf("create compactor provider: %w", err)
 		}
 
 		client := gopiai.NewClient(provider)
@@ -60,15 +59,15 @@ func NewCompactor(config *CompactorConfig) *DefaultCompactor {
 		}
 	}
 
-	return &DefaultCompactor{
+	return &LLMCompactor{
 		complete:         config.Complete,
 		model:            config.Model,
 		keepRecentTokens: config.KeepRecentTokens,
 		maxSummaryTokens: config.MaxSummaryTokens,
-	}
+	}, nil
 }
 
-func (c *DefaultCompactor) PrepareCompaction(pathEntries []Entry) *CompactionPreparation {
+func (c *LLMCompactor) PrepareCompaction(pathEntries []Entry) *CompactionPreparation {
 	var previousSummary string
 	activeStart := 0
 	for i, entry := range pathEntries {
@@ -118,7 +117,7 @@ func (c *DefaultCompactor) PrepareCompaction(pathEntries []Entry) *CompactionPre
 	}
 }
 
-func (c *DefaultCompactor) Compact(ctx context.Context, prep *CompactionPreparation) (*CompactionEntry, error) {
+func (c *LLMCompactor) Compact(ctx context.Context, prep *CompactionPreparation) (*CompactionEntry, error) {
 	var messages []gopiai.Message
 	for _, entry := range prep.EntriesToSummarize {
 		if me, ok := entry.(*MessageEntry); ok {
@@ -147,29 +146,81 @@ func (c *DefaultCompactor) Compact(ctx context.Context, prep *CompactionPreparat
 	}, nil
 }
 
-// ---------------------------------------------------------------------------
-// Unexported helpers
-// ---------------------------------------------------------------------------
-
-func findLastUsage(messages []gopiai.Message) *gopiai.AssistantMessage {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if am, ok := messages[i].(gopiai.AssistantMessage); ok {
-			if am.StopReason != gopiai.StopReasonAborted &&
-				am.StopReason != gopiai.StopReasonError &&
-				am.Usage.TotalTokens > 0 {
-				return &am
+func serializeConversation(messages []gopiai.Message) string {
+	var sb strings.Builder
+	for _, m := range messages {
+		role := strings.ToUpper(m.Role())
+		fmt.Fprintf(&sb, "[%s]\n", role)
+		for _, c := range m.GetContents() {
+			switch v := c.(type) {
+			case gopiai.TextContent:
+				sb.WriteString(v.Text)
+				sb.WriteString("\n")
+			case gopiai.ToolCall:
+				args, _ := json.Marshal(v.Arguments)
+				fmt.Fprintf(&sb, "Tool call: %s(%s)\n", v.Name, string(args))
+			case gopiai.ImageContent:
+				sb.WriteString("[image]\n")
 			}
 		}
-		if am, ok := messages[i].(*gopiai.AssistantMessage); ok {
-			if am.StopReason != gopiai.StopReasonAborted &&
-				am.StopReason != gopiai.StopReasonError &&
-				am.Usage.TotalTokens > 0 {
-				return am
-			}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func generateSummary(
+	ctx context.Context,
+	messages []gopiai.Message,
+	complete func(ctx context.Context, req gopiai.Request) (gopiai.AssistantMessage, error),
+	model string,
+	maxTokens int,
+	previousSummary string,
+) (string, error) {
+	conversationText := serializeConversation(messages)
+
+	var promptText strings.Builder
+	fmt.Fprintf(&promptText, "<conversation>\n%s\n</conversation>\n\n", conversationText)
+
+	if previousSummary != "" {
+		fmt.Fprintf(&promptText, "<previous-summary>\n%s\n</previous-summary>\n\n", previousSummary)
+		promptText.WriteString(updateSummarizationPrompt)
+	} else {
+		promptText.WriteString(summarizationPrompt)
+	}
+
+	req := gopiai.Request{
+		Model:        model,
+		SystemPrompt: summarySystemPrompt,
+		Messages: []gopiai.Message{
+			gopiai.UserMessage{
+				Contents: []gopiai.Content{
+					gopiai.TextContent{Text: promptText.String()},
+				},
+			},
+		},
+		MaxTokens: &maxTokens,
+	}
+
+	resp, err := complete(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("summarization failed: %w", err)
+	}
+
+	if resp.StopReason == gopiai.StopReasonError {
+		return "", fmt.Errorf("summarization failed: unknown error")
+	}
+
+	var parts []string
+	for _, c := range resp.Contents {
+		if tc, ok := c.(gopiai.TextContent); ok {
+			parts = append(parts, tc.Text)
 		}
 	}
-	return nil
+	return strings.Join(parts, "\n"), nil
 }
+
+// ---------------------------------------------------------------------------// Token estimation helpers
+// ---------------------------------------------------------------------------
 
 func estimateTokens(msg gopiai.Message) int {
 	var chars int
@@ -272,27 +323,28 @@ func findCutPoint(messages []gopiai.Message, keepRecentTokens int) int {
 	return cutIndex
 }
 
-func serializeConversation(messages []gopiai.Message) string {
-	var sb strings.Builder
-	for _, m := range messages {
-		role := strings.ToUpper(m.Role())
-		fmt.Fprintf(&sb, "[%s]\n", role)
-		for _, c := range m.GetContents() {
-			switch v := c.(type) {
-			case gopiai.TextContent:
-				sb.WriteString(v.Text)
-				sb.WriteString("\n")
-			case gopiai.ToolCall:
-				args, _ := json.Marshal(v.Arguments)
-				fmt.Fprintf(&sb, "Tool call: %s(%s)\n", v.Name, string(args))
-			case gopiai.ImageContent:
-				sb.WriteString("[image]\n")
+func findLastUsage(messages []gopiai.Message) *gopiai.AssistantMessage {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if am, ok := messages[i].(gopiai.AssistantMessage); ok {
+			if am.StopReason != gopiai.StopReasonAborted &&
+				am.StopReason != gopiai.StopReasonError &&
+				am.Usage.TotalTokens > 0 {
+				return &am
 			}
 		}
-		sb.WriteString("\n")
+		if am, ok := messages[i].(*gopiai.AssistantMessage); ok {
+			if am.StopReason != gopiai.StopReasonAborted &&
+				am.StopReason != gopiai.StopReasonError &&
+				am.Usage.TotalTokens > 0 {
+				return am
+			}
+		}
 	}
-	return sb.String()
+	return nil
 }
+
+// ---------------------------------------------------------------------------// Summarization prompts
+// ---------------------------------------------------------------------------
 
 const summarySystemPrompt = `You are a summarization assistant. Your job is to create structured summaries of conversations. Be precise and preserve important details like names, IDs, error messages, and technical specifics.`
 
@@ -366,54 +418,3 @@ Use this EXACT format:
 - [Preserve important context, add new if needed]
 
 Keep each section concise. Preserve exact names, IDs, and error messages.`
-
-func generateSummary(
-	ctx context.Context,
-	messages []gopiai.Message,
-	complete func(ctx context.Context, req gopiai.Request) (gopiai.AssistantMessage, error),
-	model string,
-	maxTokens int,
-	previousSummary string,
-) (string, error) {
-	conversationText := serializeConversation(messages)
-
-	var promptText strings.Builder
-	fmt.Fprintf(&promptText, "<conversation>\n%s\n</conversation>\n\n", conversationText)
-
-	if previousSummary != "" {
-		fmt.Fprintf(&promptText, "<previous-summary>\n%s\n</previous-summary>\n\n", previousSummary)
-		promptText.WriteString(updateSummarizationPrompt)
-	} else {
-		promptText.WriteString(summarizationPrompt)
-	}
-
-	req := gopiai.Request{
-		Model:        model,
-		SystemPrompt: summarySystemPrompt,
-		Messages: []gopiai.Message{
-			gopiai.UserMessage{
-				Contents: []gopiai.Content{
-					gopiai.TextContent{Text: promptText.String()},
-				},
-			},
-		},
-		MaxTokens: &maxTokens,
-	}
-
-	resp, err := complete(ctx, req)
-	if err != nil {
-		return "", fmt.Errorf("summarization failed: %w", err)
-	}
-
-	if resp.StopReason == gopiai.StopReasonError {
-		return "", fmt.Errorf("summarization failed: unknown error")
-	}
-
-	var parts []string
-	for _, c := range resp.Contents {
-		if tc, ok := c.(gopiai.TextContent); ok {
-			parts = append(parts, tc.Text)
-		}
-	}
-	return strings.Join(parts, "\n"), nil
-}

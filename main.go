@@ -4,11 +4,12 @@ import (
 	"log"
 	"os"
 
-	"github.com/joho/godotenv"
 	"slack-agent/internal/handler"
 	"slack-agent/internal/media"
-	ourslack "slack-agent/internal/slack"
+	slackclient "slack-agent/internal/slack"
 	"slack-agent/internal/store"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
@@ -40,7 +41,7 @@ func main() {
 	})
 	defer d.Close()
 
-	c, err := ourslack.New(ourslack.Config{
+	c, err := slackclient.New(slackclient.Config{
 		AppToken:    appToken,
 		BotToken:    botToken,
 		Store:       st,

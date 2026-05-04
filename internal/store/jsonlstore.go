@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -41,6 +42,8 @@ func NewJSONLStore(cfg JSONLStoreConfig) (*JSONLStore, error) {
 
 func (s *JSONLStore) LogMessage(msg Message) (bool, error) {
 	key := fmt.Sprintf("%s:%s", msg.ChannelID, msg.ID)
+
+	log.Printf("LogMessage: %s", msg.Text)
 
 	if s.dedup.IsDuplicate(key) {
 		return false, nil

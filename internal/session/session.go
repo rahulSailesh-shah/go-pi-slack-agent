@@ -10,9 +10,9 @@ import (
 type EventListener func(event agent.AgentEvent)
 
 type AgentSession struct {
-	agent          *agent.Agent
-	sessionManager Manager
-	compactor      Compactor
+	agent     *agent.Agent
+	manager   *Manager
+	compactor Compactor
 
 	mu             sync.Mutex
 	listeners      map[int]EventListener
@@ -31,17 +31,21 @@ type AgentSession struct {
 }
 
 type Config struct {
-	Agent          *agent.Agent
-	SessionManager Manager
-	Compactor      Compactor
+	Agent   *agent.Agent
+	Manager *Manager
 }
 
 func NewAgentSession(config Config) *AgentSession {
+	compactor, err := NewCompactor(nil)
+	if err != nil {
+		// Log the error but continue - compactor may be nil
+		// TODO: consider making NewAgentSession return error
+	}
 	s := &AgentSession{
-		agent:          config.Agent,
-		sessionManager: config.SessionManager,
-		compactor:      config.Compactor,
-		listeners:      make(map[int]EventListener),
+		agent:     config.Agent,
+		manager:   config.Manager,
+		compactor: compactor,
+		listeners: make(map[int]EventListener),
 	}
 	s.unsubAgent = s.agent.Subscribe(s.handleAgentEvent)
 
@@ -82,7 +86,7 @@ func (s *AgentSession) handleAgentEvent(event agent.AgentEvent) {
 	case agent.MessageEnd:
 		message := e.Message
 		if message.Role() == "user" || message.Role() == "assistant" || message.Role() == "tool" {
-			if _, err := s.sessionManager.AppendMessage(message); err != nil {
+			if _, err := s.manager.AppendMessage(message); err != nil {
 				_ = err // TODO: proper logging
 			}
 		}
@@ -98,9 +102,7 @@ func (s *AgentSession) handleAgentEvent(event agent.AgentEvent) {
 			// TODO: Handle retry logic
 			// TODO: Handle compaction
 		}
-
 	}
-
 }
 
 func (s *AgentSession) Prompt(ctx context.Context, text string, images ...agent.ImageContent) error {
@@ -136,7 +138,7 @@ func (s *AgentSession) checkCompaction(ctx context.Context, lastAssistant *agent
 
 	contextWindow := 200000
 
-	latestCompaction := s.sessionManager.GetLatestCompaction()
+	latestCompaction := s.manager.GetLatestCompaction()
 	if latestCompaction != nil && lastAssistant.Timestamp.Before(latestCompaction.Timestamp) {
 		return
 	}
@@ -172,7 +174,7 @@ func (s *AgentSession) checkCompaction(ctx context.Context, lastAssistant *agent
 }
 
 func (s *AgentSession) runCompaction(ctx context.Context) {
-	branch := s.sessionManager.GetBranch(nil)
+	branch := s.manager.GetBranch(nil)
 	if len(branch) == 0 {
 		return
 	}
@@ -192,7 +194,7 @@ func (s *AgentSession) runCompaction(ctx context.Context) {
 		return
 	}
 
-	if _, err := s.sessionManager.AppendCompaction(
+	if _, err := s.manager.AppendCompaction(
 		entry.Summary,
 		entry.FirstKeptEntryID,
 		entry.TokensBefore,
@@ -202,7 +204,7 @@ func (s *AgentSession) runCompaction(ctx context.Context) {
 		return
 	}
 
-	sessionContext := s.sessionManager.BuildSessionContext()
+	sessionContext := s.manager.BuildSessionContext()
 	s.agent.ReplaceMessages(sessionContext.Messages)
 }
 
