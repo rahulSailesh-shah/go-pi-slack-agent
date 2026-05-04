@@ -7,11 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"slack-agent/internal/handler"
+	"slack-agent/internal/media"
+	"slack-agent/internal/store"
+
 	slacklib "github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
-	"slack-agent/internal/media"
-	"slack-agent/internal/store"
 )
 
 type Client struct {
@@ -19,7 +21,7 @@ type Client struct {
 	socket      *socketmode.Client
 	store       store.Store
 	fileHandler media.FileHandler
-	handler     Handler
+	handler     handler.Handler
 	botUserID   string
 	startupTs   string
 	poster      func(channelID, text string) error
@@ -30,7 +32,7 @@ type Config struct {
 	BotToken    string
 	Store       store.Store
 	FileHandler media.FileHandler
-	Handler     Handler
+	Handler     handler.Handler
 }
 
 func New(cfg Config) (*Client, error) {
@@ -133,19 +135,6 @@ func (c *Client) onMessage(evt *socketmode.Event, client *socketmode.Client) {
 
 	msg := toMessage(ev.Channel, ev.User, ev.TimeStamp, ev.Text)
 
-	if _, err := c.store.LogMessage(msg); err != nil {
-		log.Printf("LogMessage: %v", err)
-	}
-	if msg.ID < c.startupTs {
-		return
-	}
-
-	if !isDM && ev.SubType != "file_share" {
-		return
-	}
-
-	// ev.Message is *slack.Msg (slackevents.MessageEvent.Message field type)
-	// Files for file_share subtypes live in ev.Message.Files
 	var files []rawFile
 	if ev.SubType == "file_share" && ev.Message != nil {
 		for _, f := range ev.Message.Files {
@@ -158,15 +147,26 @@ func (c *Client) onMessage(evt *socketmode.Event, client *socketmode.Client) {
 		}
 	}
 
-	c.dispatchToHandler(msg, toFiles(files))
+	storeFiles := toFiles(files)
+	if len(storeFiles) > 0 {
+		msg.Attachments = c.fileHandler.ProcessAttachments(msg.ChannelID, storeFiles, msg.ID)
+	}
+
+	if _, err := c.store.LogMessage(msg); err != nil {
+		log.Printf("LogMessage: %v", err)
+	}
+	if msg.ID < c.startupTs {
+		return
+	}
+
+	if !isDM && ev.SubType != "file_share" {
+		return
+	}
+
+	c.dispatchToHandler(msg, storeFiles)
 }
 
 func (c *Client) dispatchToHandler(msg store.Message, files []store.File) {
-	if len(files) > 0 {
-		attachments := c.fileHandler.ProcessAttachments(msg.ChannelID, files, msg.ID)
-		msg.Attachments = attachments
-	}
-
 	if strings.TrimSpace(strings.ToLower(msg.Text)) == "stop" {
 		go func() {
 			defer func() {
@@ -185,6 +185,7 @@ func (c *Client) dispatchToHandler(msg store.Message, files []store.File) {
 				log.Printf("HandleEvent panic: %v", r)
 			}
 		}()
+
 		c.handler.HandleEvent(msg, files)
 	}()
 }

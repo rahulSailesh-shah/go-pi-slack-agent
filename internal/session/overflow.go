@@ -29,16 +29,8 @@ var overflowPatterns = []*regexp.Regexp{
 var cerebrasPattern = regexp.MustCompile(`(?i)^4(00|13)\s*(status code)?\s*\(no body\)`)
 
 func IsContextOverflow(message *agent.AssistantMessage, contextWindow int) bool {
-	if message.StopReason == agent.StopReasonError && message.ErrorMessage != "" {
-		for _, p := range overflowPatterns {
-			if p.MatchString(message.ErrorMessage) {
-				return true
-			}
-		}
-		if cerebrasPattern.MatchString(message.ErrorMessage) {
-			return true
-		}
-	}
+	// message.ErrorMessage has been removed from AssistantMessage.
+	// We no longer match the error string for overflow.
 
 	if contextWindow > 0 && message.StopReason == agent.StopReasonStop {
 		if message.Usage.PromptTokens > contextWindow {

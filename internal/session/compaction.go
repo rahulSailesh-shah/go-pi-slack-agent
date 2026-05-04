@@ -406,11 +406,7 @@ func generateSummary(
 	}
 
 	if resp.StopReason == gopiai.StopReasonError {
-		errMsg := resp.ErrorMessage
-		if errMsg == "" {
-			errMsg = "unknown error"
-		}
-		return "", fmt.Errorf("summarization failed: %s", errMsg)
+		return "", fmt.Errorf("summarization failed: unknown error")
 	}
 
 	var parts []string
