@@ -12,14 +12,14 @@ import (
 
 type Manager struct {
 	mu      sync.RWMutex
-	store   Store
+	store   EntryStore
 	header  *Header
 	entries []Entry
 	byID    map[string]Entry
 	leafID  *string
 }
 
-func Open(store Store) (*Manager, error) {
+func NewSessionManager(store EntryStore) (*Manager, error) {
 	header, entries, err := store.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load session: %w", err)

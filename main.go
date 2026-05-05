@@ -4,12 +4,14 @@ import (
 	"log"
 	"os"
 
+	"github.com/joho/godotenv"
+	"github.com/rahulSailesh-shah/go-pi-ai/openai"
+
 	"slack-agent/internal/handler"
 	"slack-agent/internal/media"
+	"slack-agent/internal/runner"
 	slackclient "slack-agent/internal/slack"
-	"slack-agent/internal/store"
-
-	"github.com/joho/godotenv"
+	msglog "slack-agent/internal/store"
 )
 
 func main() {
@@ -18,7 +20,7 @@ func main() {
 	botToken := os.Getenv("BOT_TOKEN")
 	appToken := os.Getenv("APP_TOKEN")
 
-	st, err := store.NewJSONLStore(store.JSONLStoreConfig{WorkingDir: "data"})
+	st, err := msglog.NewJSONLStore(msglog.JSONLStoreConfig{WorkingDir: "data"})
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
@@ -33,15 +35,37 @@ func main() {
 	}
 	defer fh.Close()
 
+	provider, err := openai.NewProvider(openai.Config{
+		APIKey:  os.Getenv("NVIDIA_API_KEY"),
+		BaseURL: os.Getenv("NVIDIA_BASE_URL"),
+	})
+	if err != nil {
+		log.Fatalf("provider: %v", err)
+	}
+
+	factory := runner.New(runner.Config{
+		DataDir:      "data",
+		SystemPrompt: "You are a helpful assistant in a Slack workspace.",
+		Provider:     provider,
+		ModelName:    "openai/gpt-oss-120b",
+	})
+
+	// Assigned after slackclient.New to break initialization cycle.
+	var slack *slackclient.Client
+
 	d := handler.NewDispatcher(handler.Config{
-		BufferSize: 64,
-		Processor: func(msg store.Message, files []store.File) {
-			log.Printf("[%s] event: %s", msg.ChannelID, msg.Text)
+		BufferSize:     64,
+		SessionFactory: factory.Create,
+		Responder: func(channelID, text string) error {
+			if slack == nil {
+				return nil
+			}
+			return slack.PostMessage(channelID, text)
 		},
 	})
 	defer d.Close()
 
-	c, err := slackclient.New(slackclient.Config{
+	slack, err = slackclient.New(slackclient.Config{
 		AppToken:    appToken,
 		BotToken:    botToken,
 		Store:       st,
@@ -52,5 +76,5 @@ func main() {
 		log.Fatalf("slack: %v", err)
 	}
 
-	log.Fatal(c.Run())
+	log.Fatal(slack.Run())
 }

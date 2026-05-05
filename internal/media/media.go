@@ -1,8 +1,8 @@
 package media
 
-import "slack-agent/internal/store"
+import msglog "slack-agent/internal/store"
 
 type FileHandler interface {
-	ProcessAttachments(channelID string, files []store.File, timestamp string) []store.Attachment
+	ProcessAttachments(channelID string, files []msglog.File, timestamp string) []msglog.Attachment
 	Close() error
 }

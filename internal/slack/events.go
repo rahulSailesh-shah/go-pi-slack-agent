@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"slack-agent/internal/store"
+	msglog "slack-agent/internal/store"
 )
 
 // rawFile holds file attachment fields extracted from a Slack event payload.
@@ -18,9 +18,9 @@ type rawFile struct {
 	Mimetype           string
 }
 
-func toMessage(channelID, userID, ts, text string) store.Message {
+func toMessage(channelID, userID, ts, text string) msglog.Message {
 	tsFloat, _ := strconv.ParseFloat(ts, 64)
-	return store.Message{
+	return msglog.Message{
 		ID:        ts,
 		ChannelID: channelID,
 		Timestamp: time.Unix(int64(tsFloat), 0),
@@ -30,8 +30,8 @@ func toMessage(channelID, userID, ts, text string) store.Message {
 	}
 }
 
-func toFiles(files []rawFile) []store.File {
-	result := make([]store.File, 0, len(files))
+func toFiles(files []rawFile) []msglog.File {
+	result := make([]msglog.File, 0, len(files))
 	for _, f := range files {
 		url := f.URLPrivateDownload
 		if url == "" {
@@ -40,7 +40,7 @@ func toFiles(files []rawFile) []store.File {
 		if url == "" || f.Name == "" {
 			continue
 		}
-		result = append(result, store.File{
+		result = append(result, msglog.File{
 			Name:        f.Name,
 			URL:         url,
 			ContentType: f.Mimetype,

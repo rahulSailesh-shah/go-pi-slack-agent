@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -91,4 +92,32 @@ func (s *JSONLStore) getChannelDir(channelID string) (string, error) {
 
 	s.dirCache.Store(channelID, dir)
 	return dir, nil
+}
+
+func LoadMessages(dir, channelID string) ([]Message, error) {
+	logPath := filepath.Join(dir, channelID, "log.jsonl")
+	f, err := os.Open(logPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var msgs []Message
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var msg Message
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+		msgs = append(msgs, msg)
+	}
+	return msgs, scanner.Err()
 }

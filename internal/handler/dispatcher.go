@@ -1,53 +1,56 @@
 package handler
 
 import (
+	"context"
 	"log"
+	"strings"
 	"sync"
 
-	"slack-agent/internal/store"
+	agent "github.com/rahulSailesh-shah/go-pi-agent"
+
+	"slack-agent/internal/session"
+	msglog "slack-agent/internal/store"
 )
 
-type Processor func(msg store.Message, files []store.File)
-
 type Config struct {
-	BufferSize int
-	Processor  Processor
+	BufferSize     int
+	SessionFactory func(channelID string) (*session.AgentSession, []msglog.Message)
+	Responder      func(channelID, text string) error
 }
 
 type event struct {
-	msg   store.Message
-	files []store.File
+	msg   msglog.Message
+	files []msglog.File
 }
 
 type channelWorker struct {
-	ch     chan event
-	stopCh chan struct{}
-	done   chan struct{}
+	channelID string
+	session   *session.AgentSession
+	ch        chan event
+	stopCh    chan struct{}
+	done      chan struct{}
 }
 
 type Dispatcher struct {
-	mu        sync.Mutex
-	workers   map[string]*channelWorker
-	processor Processor
-	bufSize   int
-	closed    bool
+	mu      sync.Mutex
+	workers map[string]*channelWorker
+	cfg     Config
+	closed  bool
 }
 
 var _ Handler = (*Dispatcher)(nil)
 
 func NewDispatcher(cfg Config) *Dispatcher {
-	bs := cfg.BufferSize
-	if bs <= 0 {
-		bs = 64
+	if cfg.BufferSize <= 0 {
+		cfg.BufferSize = 64
 	}
 	return &Dispatcher{
-		workers:   make(map[string]*channelWorker),
-		processor: cfg.Processor,
-		bufSize:   bs,
+		workers: make(map[string]*channelWorker),
+		cfg:     cfg,
 	}
 }
 
-func (d *Dispatcher) HandleEvent(msg store.Message, files []store.File) {
+func (d *Dispatcher) HandleEvent(msg msglog.Message, files []msglog.File) {
 	w := d.getOrCreateWorker(msg.ChannelID)
 	if w == nil {
 		return
@@ -69,6 +72,10 @@ func (d *Dispatcher) HandleStop(channelID string) {
 	delete(d.workers, channelID)
 	d.mu.Unlock()
 
+	if w.session != nil {
+		w.session.Abort()
+		w.session.Dispose()
+	}
 	close(w.stopCh)
 }
 
@@ -87,6 +94,10 @@ func (d *Dispatcher) Close() {
 	d.mu.Unlock()
 
 	for _, w := range workers {
+		if w.session != nil {
+			w.session.Abort()
+			w.session.Dispose()
+		}
 		close(w.stopCh)
 	}
 }
@@ -103,12 +114,56 @@ func (d *Dispatcher) getOrCreateWorker(channelID string) *channelWorker {
 		return w
 	}
 
+	sess, pending := d.cfg.SessionFactory(channelID)
+	if sess == nil {
+		log.Printf("handler: session factory returned nil for channel %s", channelID)
+		return nil
+	}
+
 	w := &channelWorker{
-		ch:     make(chan event, d.bufSize),
-		stopCh: make(chan struct{}),
-		done:   make(chan struct{}),
+		channelID: channelID,
+		session:   sess,
+		ch:        make(chan event, d.cfg.BufferSize),
+		stopCh:    make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	d.workers[channelID] = w
+
+	// Subscribe once — fires in agent goroutine on each run.
+	sess.Subscribe(func(evt agent.AgentEvent) {
+		e, ok := evt.(agent.AgentEnd)
+		if !ok {
+			return
+		}
+		for i := len(e.Messages) - 1; i >= 0; i-- {
+			msg, ok := e.Messages[i].(agent.AssistantMessage)
+			if !ok {
+				continue
+			}
+			var sb strings.Builder
+			for _, c := range msg.Contents {
+				if t, ok := c.(agent.TextContent); ok {
+					sb.WriteString(t.Text)
+				}
+			}
+			if text := sb.String(); text != "" {
+				if err := d.cfg.Responder(channelID, text); err != nil {
+					log.Printf("handler: responder error for channel %s: %v", channelID, err)
+				}
+			}
+			break
+		}
+	})
+
+	// Inject recovered messages before starting the goroutine so they are
+	// processed before any newly arriving events.
+	for _, msg := range pending {
+		select {
+		case w.ch <- event{msg: msg}:
+		default:
+			log.Printf("handler: buffer full, dropping recovered message %s for channel %s", msg.ID, channelID)
+		}
+	}
 
 	go d.runWorker(w)
 	return w
@@ -124,13 +179,17 @@ func drainDiscard(ch <-chan event) {
 	}
 }
 
-func (d *Dispatcher) processEvent(evt event) {
+func (d *Dispatcher) processEvent(w *channelWorker, evt event) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("handler: processor panic on channel %s: %v", evt.msg.ChannelID, r)
+			log.Printf("handler: panic on channel %s: %v", evt.msg.ChannelID, r)
 		}
 	}()
-	d.processor(evt.msg, evt.files)
+
+	text := buildUserMessage(evt.msg)
+	if err := w.session.Prompt(context.Background(), text); err != nil {
+		log.Printf("handler: prompt error on channel %s: %v", evt.msg.ChannelID, err)
+	}
 }
 
 func (d *Dispatcher) runWorker(w *channelWorker) {
@@ -144,7 +203,7 @@ func (d *Dispatcher) runWorker(w *channelWorker) {
 			if !ok {
 				return
 			}
-			d.processEvent(evt)
+			d.processEvent(w, evt)
 			select {
 			case <-w.stopCh:
 				drainDiscard(w.ch)
@@ -153,4 +212,16 @@ func (d *Dispatcher) runWorker(w *channelWorker) {
 			}
 		}
 	}
+}
+
+// buildUserMessage formats the Slack message for the LLM.
+func buildUserMessage(msg msglog.Message) string {
+	var sb strings.Builder
+	if msg.UserName != "" {
+		sb.WriteString("[")
+		sb.WriteString(msg.UserName)
+		sb.WriteString("]: ")
+	}
+	sb.WriteString(msg.Text)
+	return sb.String()
 }

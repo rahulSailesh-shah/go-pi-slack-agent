@@ -15,6 +15,7 @@ import (
 type JSONLStore struct {
 	filePath string
 	file     *os.File
+	isNew    bool
 }
 
 func NewJSONLStore(filePath string) (*JSONLStore, error) {
@@ -32,7 +33,7 @@ func NewJSONLStore(filePath string) (*JSONLStore, error) {
 		return nil, err
 	}
 
-	s := &JSONLStore{filePath: filePath, file: f}
+	s := &JSONLStore{filePath: filePath, file: f, isNew: isNew}
 
 	if isNew {
 		cwd, _ := os.Getwd()
@@ -116,6 +117,10 @@ func (s *JSONLStore) Append(entry Entry) error {
 
 func (s *JSONLStore) Close() error {
 	return s.file.Close()
+}
+
+func (s *JSONLStore) IsNew() bool {
+	return s.isNew
 }
 
 func parseEntry(entryType string, data []byte) (Entry, error) {

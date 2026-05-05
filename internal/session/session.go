@@ -38,8 +38,7 @@ type Config struct {
 func NewAgentSession(config Config) *AgentSession {
 	compactor, err := NewCompactor(nil)
 	if err != nil {
-		// Log the error but continue - compactor may be nil
-		// TODO: consider making NewAgentSession return error
+		return nil
 	}
 	s := &AgentSession{
 		agent:     config.Agent,
@@ -115,6 +114,7 @@ func (s *AgentSession) Prompt(ctx context.Context, text string, images ...agent.
 		return err
 	}
 
+	<-s.agent.WaitForIdle()
 	return nil
 }
 

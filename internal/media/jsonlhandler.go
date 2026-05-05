@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"slack-agent/internal/store"
+	msglog "slack-agent/internal/store"
 )
 
 type JSONLFileHandler struct {
@@ -53,8 +53,8 @@ func NewJSONLFileHandler(cfg JSONLFileHandlerConfig) (*JSONLFileHandler, error) 
 	return handler, nil
 }
 
-func (h *JSONLFileHandler) ProcessAttachments(channelID string, files []store.File, timestamp string) []store.Attachment {
-	attachments := make([]store.Attachment, 0, len(files))
+func (h *JSONLFileHandler) ProcessAttachments(channelID string, files []msglog.File, timestamp string) []msglog.Attachment {
+	attachments := make([]msglog.Attachment, 0, len(files))
 
 	for _, file := range files {
 		if file.URL == "" || file.Name == "" {
@@ -71,7 +71,7 @@ func (h *JSONLFileHandler) ProcessAttachments(channelID string, files []store.Fi
 
 		select {
 		case h.downloadCh <- job:
-			attachments = append(attachments, store.Attachment{
+			attachments = append(attachments, msglog.Attachment{
 				Original: file.Name,
 				Local:    localPath,
 			})

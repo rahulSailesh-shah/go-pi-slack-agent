@@ -9,7 +9,7 @@ import (
 
 	"slack-agent/internal/handler"
 	"slack-agent/internal/media"
-	"slack-agent/internal/store"
+	msglog "slack-agent/internal/store"
 
 	slacklib "github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -19,7 +19,7 @@ import (
 type Client struct {
 	api         *slacklib.Client
 	socket      *socketmode.Client
-	store       store.Store
+	store       msglog.MessageLogger
 	fileHandler media.FileHandler
 	handler     handler.Handler
 	botUserID   string
@@ -30,7 +30,7 @@ type Client struct {
 type Config struct {
 	AppToken    string
 	BotToken    string
-	Store       store.Store
+	Store       msglog.MessageLogger
 	FileHandler media.FileHandler
 	Handler     handler.Handler
 }
@@ -63,10 +63,8 @@ func New(cfg Config) (*Client, error) {
 	return c, nil
 }
 
-func (c *Client) PostMessage(channelID, text string) {
-	if err := c.poster(channelID, text); err != nil {
-		log.Printf("PostMessage %s: %v", channelID, err)
-	}
+func (c *Client) PostMessage(channelID, text string) error {
+	return c.poster(channelID, text)
 }
 
 func (c *Client) Run() error {
@@ -77,6 +75,7 @@ func (c *Client) Run() error {
 }
 
 func (c *Client) onAppMention(evt *socketmode.Event, client *socketmode.Client) {
+	log.Printf("onAppMention: %v", evt)
 	evAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 	if !ok {
 		client.Ack(*evt.Request)
@@ -105,6 +104,7 @@ func (c *Client) onAppMention(evt *socketmode.Event, client *socketmode.Client) 
 }
 
 func (c *Client) onMessage(evt *socketmode.Event, client *socketmode.Client) {
+	log.Printf("onMessage: %v", evt)
 	evAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 	if !ok {
 		client.Ack(*evt.Request)
@@ -166,7 +166,7 @@ func (c *Client) onMessage(evt *socketmode.Event, client *socketmode.Client) {
 	c.dispatchToHandler(msg, storeFiles)
 }
 
-func (c *Client) dispatchToHandler(msg store.Message, files []store.File) {
+func (c *Client) dispatchToHandler(msg msglog.Message, files []msglog.File) {
 	if strings.TrimSpace(strings.ToLower(msg.Text)) == "stop" {
 		go func() {
 			defer func() {

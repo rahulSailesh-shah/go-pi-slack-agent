@@ -1,6 +1,6 @@
 package store
 
-type Store interface {
+type MessageLogger interface {
 	LogMessage(msg Message) (bool, error)
 	Close() error
 }
