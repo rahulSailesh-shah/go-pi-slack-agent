@@ -7,8 +7,10 @@ import (
 
 	agent "github.com/rahulSailesh-shah/go-pi-agent"
 
+	"slack-agent/internal/sandbox"
 	"slack-agent/internal/session"
 	msglog "slack-agent/internal/store"
+	"slack-agent/internal/tools"
 )
 
 type Config struct {
@@ -16,7 +18,7 @@ type Config struct {
 	SystemPrompt string
 	Provider     agent.Provider
 	ModelName    string
-	Tools        []agent.AgentTool
+	Executor     sandbox.Executor
 }
 
 type Factory struct {
@@ -42,12 +44,14 @@ func (f *Factory) Create(channelID string) (*session.AgentSession, []msglog.Mess
 		return nil, nil
 	}
 
+	toolSet := tools.NewToolSet(f.cfg.Executor, channelID)
+
 	a := agent.NewAgent(
 		agent.WithInitialState(&agent.AgentState{
 			SystemPrompt: f.cfg.SystemPrompt,
 			Provider:     f.cfg.Provider,
 			ModelName:    f.cfg.ModelName,
-			Tools:        f.cfg.Tools,
+			Tools:        toolSet,
 		}),
 	)
 

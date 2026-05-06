@@ -10,6 +10,7 @@ import (
 	"slack-agent/internal/handler"
 	"slack-agent/internal/media"
 	"slack-agent/internal/runner"
+	"slack-agent/internal/sandbox"
 	slackclient "slack-agent/internal/slack"
 	msglog "slack-agent/internal/store"
 )
@@ -43,11 +44,17 @@ func main() {
 		log.Fatalf("provider: %v", err)
 	}
 
+	exec, err := sandbox.NewDockerExecutor("sandbox", "data")
+	if err != nil {
+		log.Fatalf("sandbox: %v", err)
+	}
+
 	factory := runner.New(runner.Config{
 		DataDir:      "data",
 		SystemPrompt: "You are a helpful assistant in a Slack workspace.",
 		Provider:     provider,
 		ModelName:    "openai/gpt-oss-120b",
+		Executor:     exec,
 	})
 
 	// Assigned after slackclient.New to break initialization cycle.
