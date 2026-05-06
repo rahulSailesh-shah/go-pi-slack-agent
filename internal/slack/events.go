@@ -7,10 +7,10 @@ import (
 	"time"
 
 	msglog "slack-agent/internal/store"
+
+	"github.com/slack-go/slack/slackevents"
 )
 
-// rawFile holds file attachment fields extracted from a Slack event payload.
-// client.go populates this from slack.Msg.Files before calling toFiles.
 type rawFile struct {
 	Name               string
 	URLPrivate         string
@@ -53,4 +53,25 @@ var botMentionRe = regexp.MustCompile(`<@[A-Z0-9]+>`)
 
 func stripBotMention(text string) string {
 	return strings.TrimSpace(botMentionRe.ReplaceAllString(text, ""))
+}
+
+func messageEventText(ev *slackevents.MessageEvent) string {
+	if ev.Text != "" {
+		return ev.Text
+	}
+	if ev.SubType == "file_share" && ev.Message != nil && ev.Message.Text != "" {
+		return ev.Message.Text
+	}
+	return ""
+}
+
+func mentionsBot(botUserID, text string) bool {
+	return strings.Contains(text, "<@"+botUserID+">")
+}
+
+func shouldTrackMessage(ev *slackevents.MessageEvent, botUserID string) bool {
+	if ev.ChannelType == "im" {
+		return true
+	}
+	return mentionsBot(botUserID, messageEventText(ev))
 }

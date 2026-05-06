@@ -13,9 +13,10 @@ import (
 )
 
 type Config struct {
-	BufferSize     int
-	SessionFactory func(channelID string) (*session.AgentSession, []msglog.Message)
-	Responder      func(channelID, text string) error
+	BufferSize          int
+	SessionFactory      func(channelID string) (*session.AgentSession, []msglog.Message)
+	Responder           func(channelID, text string) error
+	SystemPromptBuilder func(channelID string) string
 }
 
 type event struct {
@@ -51,12 +52,18 @@ func NewDispatcher(cfg Config) *Dispatcher {
 }
 
 func (d *Dispatcher) HandleEvent(msg msglog.Message, files []msglog.File) {
-	w := d.getOrCreateWorker(msg.ChannelID)
+	w, alreadyQueued := d.getOrCreateWorker(msg.ChannelID, msg.ID)
 	if w == nil {
+		log.Printf("handler: drop message %s for channel %s (worker unavailable)", msg.ID, msg.ChannelID)
+		return
+	}
+	if alreadyQueued {
+		log.Printf("handler: skip duplicate enqueue for message %s on channel %s (already in pending replay)", msg.ID, msg.ChannelID)
 		return
 	}
 	select {
 	case w.ch <- event{msg: msg, files: files}:
+		log.Printf("handler: enqueued live message %s on channel %s", msg.ID, msg.ChannelID)
 	default:
 		log.Printf("handler: channel %s queue full, dropping message %s", msg.ChannelID, msg.ID)
 	}
@@ -102,23 +109,26 @@ func (d *Dispatcher) Close() {
 	}
 }
 
-func (d *Dispatcher) getOrCreateWorker(channelID string) *channelWorker {
+func (d *Dispatcher) getOrCreateWorker(channelID, incomingMsgID string) (*channelWorker, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if d.closed {
-		return nil
+		log.Printf("handler: dispatcher closed, cannot create worker for channel %s", channelID)
+		return nil, false
 	}
 
 	if w, ok := d.workers[channelID]; ok {
-		return w
+		log.Printf("handler: reusing worker for channel %s", channelID)
+		return w, false
 	}
 
 	sess, pending := d.cfg.SessionFactory(channelID)
 	if sess == nil {
 		log.Printf("handler: session factory returned nil for channel %s", channelID)
-		return nil
+		return nil, false
 	}
+	log.Printf("handler: created new worker for channel %s", channelID)
 
 	w := &channelWorker{
 		channelID: channelID,
@@ -155,18 +165,32 @@ func (d *Dispatcher) getOrCreateWorker(channelID string) *channelWorker {
 		}
 	})
 
-	// Inject recovered messages before starting the goroutine so they are
-	// processed before any newly arriving events.
+	alreadyQueued := pendingContainsMessageID(pending, incomingMsgID)
+	log.Printf("handler: replay pending for channel %s count=%d incoming=%s alreadyQueued=%t",
+		channelID, len(pending), incomingMsgID, alreadyQueued)
 	for _, msg := range pending {
 		select {
 		case w.ch <- event{msg: msg}:
+			log.Printf("handler: replayed pending message %s on channel %s", msg.ID, channelID)
 		default:
 			log.Printf("handler: buffer full, dropping recovered message %s for channel %s", msg.ID, channelID)
 		}
 	}
 
 	go d.runWorker(w)
-	return w
+	return w, alreadyQueued
+}
+
+func pendingContainsMessageID(pending []msglog.Message, messageID string) bool {
+	if messageID == "" {
+		return false
+	}
+	for _, msg := range pending {
+		if msg.ID == messageID {
+			return true
+		}
+	}
+	return false
 }
 
 func drainDiscard(ch <-chan event) {
@@ -186,6 +210,11 @@ func (d *Dispatcher) processEvent(w *channelWorker, evt event) {
 		}
 	}()
 
+	if d.cfg.SystemPromptBuilder != nil {
+		if p := strings.TrimSpace(d.cfg.SystemPromptBuilder(evt.msg.ChannelID)); p != "" {
+			w.session.SetSystemPrompt(p)
+		}
+	}
 	text := buildUserMessage(evt.msg)
 	if err := w.session.Prompt(context.Background(), text); err != nil {
 		log.Printf("handler: prompt error on channel %s: %v", evt.msg.ChannelID, err)

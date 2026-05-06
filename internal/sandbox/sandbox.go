@@ -53,6 +53,10 @@ func newDockerExecutor(container, dataDir string, runCmd runCmdFn) (*DockerExecu
 		return nil, fmt.Errorf("container %q is not running", container)
 	}
 
+	if err := runCmd(ctx, "docker", "exec", container, "test", "-d", "/workspace").Run(); err != nil {
+		return nil, fmt.Errorf("container %q missing /workspace mount: %w", container, err)
+	}
+
 	return &DockerExecutor{container: container, dataDir: dataDir, runCmd: runCmd}, nil
 }
 

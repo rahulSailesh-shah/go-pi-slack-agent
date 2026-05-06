@@ -1,17 +1,22 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"sync/atomic"
 
 	"github.com/joho/godotenv"
+	agent "github.com/rahulSailesh-shah/go-pi-agent"
 	"github.com/rahulSailesh-shah/go-pi-ai/openai"
 
 	"slack-agent/internal/handler"
 	"slack-agent/internal/media"
+	"slack-agent/internal/prompt"
 	"slack-agent/internal/runner"
 	"slack-agent/internal/sandbox"
 	slackclient "slack-agent/internal/slack"
+	"slack-agent/internal/tools"
 	msglog "slack-agent/internal/store"
 )
 
@@ -49,15 +54,58 @@ func main() {
 		log.Fatalf("sandbox: %v", err)
 	}
 
+	dataDir := "data"
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("getwd: %v", err)
+	}
+
+	var slackHolder atomic.Pointer[slackclient.Client]
+
+	systemPromptBuilder := func(channelID string) string {
+		cl := slackHolder.Load()
+		if cl == nil {
+			return ""
+		}
+		ctx := context.Background()
+		users, err := cl.ListUsers(ctx)
+		if err != nil {
+			log.Printf("system prompt list users: %v", err)
+		}
+		channels, err := cl.ListChannels(ctx)
+		if err != nil {
+			log.Printf("system prompt list channels: %v", err)
+		}
+		mem := prompt.LoadMemory(dataDir, channelID)
+		skills := prompt.DiscoverSkills(dataDir, channelID, dataDir)
+		return prompt.BuildSystemPrompt(prompt.Options{
+			WorkspacePath: dataDir,
+			ChannelID:     channelID,
+			Memory:        mem,
+			IsDocker:      true,
+			HostCwd:       cwd,
+			Channels:      channels,
+			Users:         users,
+			Skills:        skills,
+		})
+	}
+
 	factory := runner.New(runner.Config{
-		DataDir:      "data",
+		DataDir:      dataDir,
 		SystemPrompt: "You are a helpful assistant in a Slack workspace.",
-		Provider:     provider,
-		ModelName:    "openai/gpt-oss-120b",
-		Executor:     exec,
+		ExtraTools: func(channelID string) []agent.AgentTool {
+			cl := slackHolder.Load()
+			if cl == nil {
+				return nil
+			}
+			return []agent.AgentTool{tools.NewSlackPostTool(cl)}
+		},
+		SystemPromptBuilder: systemPromptBuilder,
+		Provider:            provider,
+		ModelName:           "openai/gpt-oss-120b",
+		Executor:            exec,
 	})
 
-	// Assigned after slackclient.New to break initialization cycle.
 	var slack *slackclient.Client
 
 	d := handler.NewDispatcher(handler.Config{
@@ -69,6 +117,7 @@ func main() {
 			}
 			return slack.PostMessage(channelID, text)
 		},
+		SystemPromptBuilder: systemPromptBuilder,
 	})
 	defer d.Close()
 
@@ -82,6 +131,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("slack: %v", err)
 	}
+	slackHolder.Store(slack)
 
 	log.Fatal(slack.Run())
 }

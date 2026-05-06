@@ -75,7 +75,6 @@ func (c *Client) Run() error {
 }
 
 func (c *Client) onAppMention(evt *socketmode.Event, client *socketmode.Client) {
-	log.Printf("onAppMention: %v", evt)
 	evAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 	if !ok {
 		client.Ack(*evt.Request)
@@ -91,6 +90,8 @@ func (c *Client) onAppMention(evt *socketmode.Event, client *socketmode.Client) 
 		return
 	}
 
+	log.Printf("slack: app_mention channel=%s user=%s", ev.Channel, ev.User)
+
 	msg := toMessage(ev.Channel, ev.User, ev.TimeStamp, ev.Text)
 
 	if _, err := c.store.LogMessage(msg); err != nil {
@@ -104,7 +105,6 @@ func (c *Client) onAppMention(evt *socketmode.Event, client *socketmode.Client) 
 }
 
 func (c *Client) onMessage(evt *socketmode.Event, client *socketmode.Client) {
-	log.Printf("onMessage: %v", evt)
 	evAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 	if !ok {
 		client.Ack(*evt.Request)
@@ -128,12 +128,17 @@ func (c *Client) onMessage(evt *socketmode.Event, client *socketmode.Client) {
 	}
 
 	isDM := ev.ChannelType == "im"
-	isBotMention := strings.Contains(ev.Text, "<@"+c.botUserID+">")
+	effectiveText := messageEventText(ev)
+	isBotMention := mentionsBot(c.botUserID, effectiveText)
 	if !isDM && isBotMention {
 		return
 	}
 
-	msg := toMessage(ev.Channel, ev.User, ev.TimeStamp, ev.Text)
+	if !shouldTrackMessage(ev, c.botUserID) {
+		return
+	}
+
+	msg := toMessage(ev.Channel, ev.User, ev.TimeStamp, effectiveText)
 
 	var files []rawFile
 	if ev.SubType == "file_share" && ev.Message != nil {
@@ -152,6 +157,8 @@ func (c *Client) onMessage(evt *socketmode.Event, client *socketmode.Client) {
 		msg.Attachments = c.fileHandler.ProcessAttachments(msg.ChannelID, storeFiles, msg.ID)
 	}
 
+	log.Printf("slack: message channel=%s channel_type=%s subtype=%s user=%s",
+		ev.Channel, ev.ChannelType, ev.SubType, ev.User)
 	if _, err := c.store.LogMessage(msg); err != nil {
 		log.Printf("LogMessage: %v", err)
 	}

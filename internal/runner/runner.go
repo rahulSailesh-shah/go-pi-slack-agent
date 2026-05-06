@@ -3,6 +3,7 @@ package runner
 import (
 	"log"
 	"path/filepath"
+	"strings"
 	"time"
 
 	agent "github.com/rahulSailesh-shah/go-pi-agent"
@@ -16,9 +17,14 @@ import (
 type Config struct {
 	DataDir      string
 	SystemPrompt string
-	Provider     agent.Provider
-	ModelName    string
-	Executor     sandbox.Executor
+	// SystemPromptBuilder, when non-nil, builds the system prompt per channel.
+	// If it returns empty string, SystemPrompt is used.
+	SystemPromptBuilder func(channelID string) string
+	// ExtraTools returns additional agent tools for this channel (e.g. slack_post).
+	ExtraTools func(channelID string) []agent.AgentTool
+	Provider   agent.Provider
+	ModelName  string
+	Executor   sandbox.Executor
 }
 
 type Factory struct {
@@ -45,10 +51,22 @@ func (f *Factory) Create(channelID string) (*session.AgentSession, []msglog.Mess
 	}
 
 	toolSet := tools.NewToolSet(f.cfg.Executor, channelID)
+	if f.cfg.ExtraTools != nil {
+		if extras := f.cfg.ExtraTools(channelID); len(extras) > 0 {
+			toolSet = append(toolSet, extras...)
+		}
+	}
+
+	systemPrompt := f.cfg.SystemPrompt
+	if f.cfg.SystemPromptBuilder != nil {
+		if p := strings.TrimSpace(f.cfg.SystemPromptBuilder(channelID)); p != "" {
+			systemPrompt = p
+		}
+	}
 
 	a := agent.NewAgent(
 		agent.WithInitialState(&agent.AgentState{
-			SystemPrompt: f.cfg.SystemPrompt,
+			SystemPrompt: systemPrompt,
 			Provider:     f.cfg.Provider,
 			ModelName:    f.cfg.ModelName,
 			Tools:        toolSet,
